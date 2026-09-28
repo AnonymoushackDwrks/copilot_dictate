@@ -1,0 +1,6 @@
+*.log
+*.exe
+__pycache__/
+.vscode/
+crash.log
+packages_to_move.txt

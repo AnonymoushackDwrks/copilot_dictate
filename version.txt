@@ -1,0 +1,193 @@
+=============================================================================
+VOICE TYPING APPLICATION (V2C) — VERSION & CHANGELOG (version.txt)
+=============================================================================
+Application: Voice Typing Desktop Assistant (Gemini Live & Batch Transcription)
+Architecture: Single-file Python application (voice_typing_app.py)
+Platform: Windows 11 (AMD64)
+
+
+-----------------------------------------------------------------------------
+1. EXECUTIVE SUMMARY & RESOLUTION LOG
+-----------------------------------------------------------------------------
+This document tracks all errors, root-cause analyses, and architectural
+resolutions implemented during the development and stabilization of the
+Voice Typing system.
+
+Initially, the project was split across multiple scripts:
+- voice_typing.ahk (AutoHotkey v2 frontend controller and UI overlays)
+- voice_transcriber.py (Python backend worker executed as child process)
+
+Due to process lifecycle overhead, Windows hotkey collisions, and multi-runtime
+complexity, the architecture was consolidated into an all-in-one native
+Python solution (voice_typing_app.py) with translucent Tkinter overlays,
+direct keyboard hooks (including Copilot key interception), and direct Gemini
+API integration.
+
+-----------------------------------------------------------------------------
+2. DETAILED ERROR LOG & RESOLUTIONS
+-----------------------------------------------------------------------------
+
+[ERROR 1] ModuleNotFoundError: No module named 'numpy', 'sounddevice', 'keyboard', 'pyperclip'
+-----------------------------------------------------------------------------
+* Symptoms:
+  Running the Python script or opening it in the editor showed missing module
+  errors for 4 critical libraries.
+* Root Cause:
+  The system has multiple Python environments installed:
+  1) C:\msys64\ucrt64\bin\python.exe (Python 3.14 via MSYS2, no pip packages)
+  2) C:\Users\Dwaragesh k\AppData\Local\Python\pythoncore-3.14-64\python.exe (Python 3.14 Official, all packages installed)
+  3) C:\Users\Dwaragesh k\AppData\Local\Programs\Python\Python311\python.exe (Python 3.11 Official)
+
+  The system PATH placed MSYS2's Python first. Running 'python' or having the
+  IDE default to PATH selected the empty MSYS2 runtime.
+* Resolution:
+  1) Created d:\v2c\.vscode\settings.json configured with:
+     {"python.defaultInterpreterPath": "C:\\Users\\Dwaragesh k\\AppData\\Local\\Python\\pythoncore-3.14-64\\python.exe"}
+  2) Used the official Windows Python Launcher ('py') which maps directly to the
+     complete Python 3.14 installation.
+
+[ERROR 2] AutoHotkey v2 Syntax Error: "Invalid key name. Text: Launch7 Line: 42"
+-----------------------------------------------------------------------------
+* Symptoms:
+  voice_typing.ahk failed to load with a syntax parsing modal dialog.
+* Root Cause:
+  Line 42 contained 'Launch7:: LaunchVoiceMenu()'. AutoHotkey v2 recognizes
+  Launch_App1, Launch_App2, Launch_Mail, and Launch_Media, but 'Launch7' is not
+  a recognized key name.
+* Resolution:
+  Commented out the invalid Launch7 binding. Retained valid Copilot combinations:
+  - '#+F23::' (Win + Shift + F23 — standard Windows Copilot key chord)
+  - '#F23::'  (Win + F23)
+  - '^+h::'   (Ctrl + Shift + H — universal fail-safe shortcut)
+
+[ERROR 3] Architecture Simplification into Single Python App (voice_typing_app.py)
+-----------------------------------------------------------------------------
+* User Goal:
+  Replace the dual AHK + Python bridge with a single, standalone Python file
+  while preserving the exact UI design (translucent dark overlays) and features.
+* Implementation:
+  Created d:\v2c\voice_typing_app.py:
+  1) UI System: Built using native Tkinter with borderless ('overrideredirect'),
+     translucent (alpha: 0.90), top-most dark windows matching the AHK GUI:
+     - Mode Selection Menu: Centered modal showing Options 1, 2, and Esc.
+     - Recording Timer Overlay: Top-right corner showing '⏺ REC  MM:SS' and status.
+  2) Key Hooking: Integrated 'keyboard' package to capture Copilot combinations
+     (Win+Shift+F23, Win+F23, F23) and 'Ctrl+Shift+H' globally without stealing
+     window focus from the user's active application.
+  3) Original files (voice_transcriber.py, voice_typing.ahk) preserved intact.
+
+[ERROR 4] Mode 2 (Batch) gemini-3.5-transcribe 400 INVALID_ARGUMENT & Fallback
+-----------------------------------------------------------------------------
+* Symptoms:
+  Mode 2 fell back to gemini-2.5-flash with log:
+  "Model gemini-3.5-transcribe failed: 400 INVALID_ARGUMENT"
+* Root Cause:
+  The code called 'client.models.generate_content(model="gemini-3.5-transcribe")'.
+  According to Google Gemini documentation, 'gemini-3.5-transcribe' is designed
+  specifically for the new Interactions API, not the legacy generate_content endpoint.
+* Resolution:
+  Refactored Mode 2 to use the Interactions API:
+  - Audio frames are serialized into an in-memory WAV buffer.
+  - The WAV is Base64-encoded.
+  - Sent via:
+      interaction = client.interactions.create(
+          model="gemini-3.5-transcribe",
+          input=[{"type": "audio", "data": b64_audio, "mime_type": "audio/wav"}]
+      )
+      transcription = interaction.output_text
+  - Verified: Mode 2 transcribes cleanly with gemini-3.5-transcribe with zero fallbacks.
+
+[ERROR 5] Mode 1 (Live) Audio Starvation & 66% Packet Loss
+-----------------------------------------------------------------------------
+* Symptoms:
+  Live session connected successfully, but no speech was transcribed or typed.
+* Root Cause:
+  Mode 1 was recording audio using:
+      audio = sd.rec(1600, samplerate=16000, channels=1, dtype='int16')
+      sd.wait()
+  in a loop. On Windows (WASAPI/MME), starting and stopping PortAudio audio
+  hardware on every 100ms chunk introduced ~200ms of driver spin-up latency per chunk.
+  Benchmarking showed:
+      Chunk took 0.300s to capture 0.100s of audio!
+  This caused 66% of the user's spoken audio to be discarded between chunks.
+  The server received fragmented, unintelligible audio syllables.
+* Resolution:
+  Replaced the polling 'sd.rec()' with a continuous 'sd.InputStream' running in a
+  dedicated callback thread, pushing into an 'asyncio.Queue'. The microphone stream
+  remains open for the entire duration with 0% dropped audio.
+
+[ERROR 6] Mode 1 (Live) Missing Transcription Config & Response Field Mismatch
+-----------------------------------------------------------------------------
+* Symptoms:
+  Even when connected, live incoming chunks produced no typed text.
+* Root Cause (Two parts):
+  1) Configuration: Gemini Live API requires 'input_audio_transcription=types.AudioTranscriptionConfig()'
+     inside LiveConnectConfig to activate the speech-to-text pipeline.
+  2) Response parsing: The script was looking for conversational chatbot turns
+     ('response.server_content.model_turn.parts'). The dedicated speech-to-text model
+     (gemini-3.5-transcribe-live) returns speech recognition in:
+     - 'response.server_content.interim_input_transcription.text' (low-latency live speech)
+     - 'response.server_content.input_transcription.text' (finalized phrase)
+* Resolution:
+  1) Added 'input_audio_transcription=types.AudioTranscriptionConfig()' to LiveConnectConfig.
+  2) Implemented real-time response parsing for 'interim_input_transcription' and
+     'input_transcription'.
+  3) Implemented smooth delta typing: compares the common prefix of what has already
+     been typed against the incoming text, sends backspaces for altered punctuation,
+     and types incremental words in real-time at the user's cursor.
+
+-----------------------------------------------------------------------------
+3. CURRENT ARCHITECTURE MATRIX
+-----------------------------------------------------------------------------
+Component              Implementation Details
+---------------------  ------------------------------------------------------
+App Script             d:\v2c\voice_typing_app.py (Single-file Python session)
+Native C Listener      d:\v2c\copilot_listener.exe (19 KB Win32 daemon, ~800 KB RAM)
+UI Framework           Tkinter (borderless, alpha transparent, topmost)
+Global Hotkey Hook     Dual-layer: RegisterHotKey + SetWindowsHookEx(WH_KEYBOARD_LL)
+Live Engine (Mode 1)   gemini-3.5-transcribe-live via Live API (Bidirectional WebSocket)
+Batch Engine (Mode 2)  gemini-3.5-transcribe via Interactions API (Base64 WAV)
+Unified Toggle Key     Copilot Key (Win+Shift+F23, Win+F23, F23, or Ctrl+Shift+H):
+                       - When idle: Native C listener launches Python session
+                       - When launched: Instantly shows Mode 1 or 2 menu
+                       - When menu is open: Cancels/closes menu & Python exits cleanly
+                       - When recording: Stops recording session, completes & exits
+Esc Key Status         Completely unhooked & freed (not used by app)
+Output Modes           Mode 1: Keyboard simulation at cursor (keyboard.write)
+                       Mode 2: Windows Clipboard cache (pyperclip.copy)
+
+-----------------------------------------------------------------------------
+4. NATIVE KB-SIZED LISTENER ARCHITECTURE (copilot_listener.exe)
+-----------------------------------------------------------------------------
+* Problem & Design Goal:
+  Running a full Python runtime in the background 24/7 wastes 50-80 MB of RAM
+  and requires background interpreter threads. The user requested a "KB-sized
+  thread, not a full Python, so it just checks whether a specific key is pressed;
+  if yes, then launch the script, highly specific."
+
+* Solution Implemented:
+  1) Pure C Win32 Daemon (d:\v2c\copilot_listener.c -> copilot_listener.exe):
+     - Compiled with GCC: `gcc -O2 -mwindows -s -o copilot_listener.exe copilot_listener.c`
+     - Final Executable Size: 19 KB (19,456 bytes).
+     - Idle Memory Footprint: ~880 KB RAM (vs ~60 MB for idle Python).
+     - CPU Usage: 0.00% (sleeps in Windows kernel GetMessage wait-state).
+  2) Dual-Layer Detection Engine:
+     - Layer 1: Win32 RegisterHotKey: Registers OS-level hotkeys for Win+Shift+F23,
+       Win+F23, F23, VK_F21 (MS Office key), and Ctrl+Shift+H directly with win32k.sys.
+     - Layer 2: Win32 Low-Level Keyboard Hook (WH_KEYBOARD_LL): Intercepts raw hardware
+       scan codes and suppresses the key so Windows does NOT launch default Copilot.
+  3) Session Mutex Handoff:
+     - Named Mutex: `Global\VoiceTypingSessionMutex`.
+     - When idle: Listener detects Copilot key -> sees mutex is not acquired ->
+       spawns `pythonw.exe d:\v2c\voice_typing_app.py` silently.
+     - While active: If Copilot key is pressed while Python is already recording,
+       the listener passes the key straight to Python so the active session stops,
+       outputs the transcription, and exits.
+  4) Python Session Auto-Exit:
+     - In d:\v2c\voice_typing_app.py, Python runs ONLY for the active transcription session.
+     - Mode 1: Stops streaming, finishes typing, and destroys itself (`sys.exit(0)`).
+     - Mode 2: Stops recording, transcribes, copies to clipboard, shows confirmation,
+       and destroys itself (`sys.exit(0)`).
+     - Menu Cancel: If Copilot is pressed or 10s idle, menu destroys itself and exits.
+     - Result: 0 MB Python RAM when idle; full resources freed immediately.
+=============================================================================
